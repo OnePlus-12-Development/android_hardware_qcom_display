@@ -394,10 +394,10 @@ void HWCSession::InitSupportedDisplaySlots() {
   }
 
   HWDisplayInterfaceInfo hw_disp_info = {};
-  error = core_intf_->GetFirstDisplayInterfaceType(&hw_disp_info);
+  error = WaitForPrimaryHotplug(&hw_disp_info);
   if (error != kErrorNone) {
     CoreInterface::DestroyCore();
-    DLOGE("Primary display type not recognized. Error = %d", error);
+    DLOGE("Primary display is not plugged. Error = %d", error);
     return;
   }
 
@@ -433,25 +433,33 @@ void HWCSession::InitSupportedDisplaySlots() {
 
   if (kPluggable == hw_disp_info.type) {
     // If primary is a pluggable display, we have already used one pluggable display interface.
-    max_pluggable--;
+    // max_pluggable/builtin can both be initialized to 0 in case of invalid panel node
+    // check to avoid overflow
+    if (max_pluggable) {
+      max_pluggable--;
+    }
   } else {
-    max_builtin--;
+    if (max_builtin) {
+      max_builtin--;
+    }
   }
 
   // Init slots in accordance to h/w capability.
   uint32_t disp_count = UINT32(std::min(max_pluggable, HWCCallbacks::kNumPluggable));
-  Display base_id = qdutils::DISPLAY_EXTERNAL;
+  Display base_id = HWC_DISPLAY_EXTERNAL;
   map_info_pluggable_.resize(disp_count);
   for (auto &map_info : map_info_pluggable_) {
     map_info.client_id = base_id++;
   }
 
+  base_id = HWC_DISPLAY_BUILTIN_2;
   disp_count = UINT32(std::min(max_builtin, HWCCallbacks::kNumBuiltIn));
   map_info_builtin_.resize(disp_count);
   for (auto &map_info : map_info_builtin_) {
     map_info.client_id = base_id++;
   }
 
+  base_id = HWC_DISPLAY_VIRTUAL;
   disp_count = UINT32(std::min(max_virtual, HWCCallbacks::kNumVirtual));
   map_info_virtual_.resize(disp_count);
   for (auto &map_info : map_info_virtual_) {
@@ -844,7 +852,6 @@ HWC3::Error HWCSession::PresentDisplay(Display display, shared_ptr<Fence> *out_r
     if (pending_power_mode_[display]) {
       status = HWC3::Error::None;
     } else {
-      hwc_display_[display]->ProcessActiveConfigChange();
       status = hwc_display_[display]->Present(out_retire_fence);
       if (status == HWC3::Error::None) {
         PostCommitLocked(display, *out_retire_fence);
@@ -3059,6 +3066,8 @@ int HWCSession::HandlePluggableDisplays(bool delay_hotplug) {
     return -EINVAL;
   }
 
+  HandlePluggablePrimaryDisplay(&hw_displays_info);
+
   int status = HandleDisconnectedDisplays(&hw_displays_info);
   if (status) {
     DLOGE("All displays could not be disconnected.");
@@ -3489,7 +3498,10 @@ void HWCSession::PerformDisplayPowerReset() {
     locker_[display].Unlock();
   }
 
-  callbacks_.Refresh(vsync_source);
+  // Do not call refresh if valid vsync source is not set i,e. Its kNumDisplay
+  if (vsync_source != HWCCallbacks::kNumDisplays) {
+    callbacks_.Refresh(vsync_source);
+  }
 }
 
 void HWCSession::DisplayPowerReset() {
@@ -4695,4 +4707,40 @@ HWC3::Error HWCSession::GetOverlaySupport(OverlayProperties *supported_props) {
   return HWC3::Error::None;
 }
 
+DisplayError HWCSession::WaitForPrimaryHotplug(HWDisplayInterfaceInfo *hw_disp_info) {
+  int wait_for_hotplug = 0;  // Default value when property is not present.
+  HWCDebugHandler::Get()->GetProperty(WAIT_FOR_PRIMARY_DISPLAY, &wait_for_hotplug);
+  DLOGI("wait_for_primary_display :%d", wait_for_hotplug);
+
+  const uint32_t kMaxAttempts = wait_for_hotplug ? 60 : 1;
+  uint32_t attempts;
+  for (attempts = 0; attempts < kMaxAttempts; attempts++) {
+    DisplayError error = core_intf_->GetFirstDisplayInterfaceType(hw_disp_info);
+    if (error != kErrorNone) {
+      return error;
+    }
+    if (hw_disp_info->is_connected) {
+      DLOGI("Primary display of type-%d is connected after %u %s", hw_disp_info->type,
+            (attempts + 1), attempts ? "attempts" : "attempt");
+      break;
+    }
+    usleep(1000000);  // sleep for 1 second
+  }
+
+  if (attempts == kMaxAttempts) {
+    LOG_ALWAYS_FATAL("Primary display of type-%d is not yet connected after %u %s",
+                     hw_disp_info->type, kMaxAttempts, kMaxAttempts == 1 ? "attempt" : "attempts");
+  }
+
+  return kErrorNone;
+}
+
+void HWCSession::HandlePluggablePrimaryDisplay(HWDisplaysInfo *hw_displays_info) {
+  for (auto &iter : *hw_displays_info) {
+    auto &info = iter.second;
+    if (info.is_primary && (info.display_type == kPluggable) && !info.is_connected) {
+      LOG_ALWAYS_FATAL("Primary pluggable display is disconnected");
+    }
+  }
+}
 }  // namespace sdm
